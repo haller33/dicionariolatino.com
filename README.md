@@ -1,7 +1,3 @@
-Here's a complete README for the [`dicionariolatino.com`](https://github.com/haller33/dicionariolatino.com) repository. You can copy and paste it directly into the repository's `README.md` file.
-
----
-
 # dicionariolatino.com
 
 [![Python Version](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)  
