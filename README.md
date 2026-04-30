@@ -46,6 +46,7 @@ Additionally, a **single‑file Lua program** (`latin.lua`) provides a powerful 
 - Lua 5.1.4 (or later)
 - `luasql.sqlite3` – install via LuaRocks:  
   `luarocks install luasql-sqlite3`  
+  *For Nix users*: `nix-shell -p uv lua52Packages.luasql-sqlite3 sqlite`  
   *For Kindle*, place the compiled `.so`/`.dll` in the same folder as `latin.lua`.
 
 ### Quick Start
