@@ -1,5 +1,5 @@
 #!/usr/bin/env lua
--- latin.lua – Latin dictionary searcher (with content_hash exclusion)
+-- latin.lua – Latin dictionary searcher (with trigram similarity)
 
 local luasql = require("luasql.sqlite3")
 
@@ -53,7 +53,7 @@ local function close_db()
 end
 
 -- ----------------------------------------------------------------------
--- Fuzzy matching (Levenshtein distance)
+-- Fuzzy matching (Levenshtein distance) – unchanged
 -- ----------------------------------------------------------------------
 local function levenshtein(s, t)
     local m, n = #s, #t
@@ -79,7 +79,6 @@ local function fuzzy_score(word, target)
     return dist / max_len
 end
 
--- FIXED: no goto, simple conditional
 local function fuzzy_search(input, max_results)
     local results = {}
     local cursor = conn:execute("SELECT word, definition, content_hash FROM dictionary")
@@ -97,6 +96,69 @@ local function fuzzy_search(input, max_results)
     end
     cursor:close()
     table.sort(results, function(a,b) return a.score < b.score end)
+    if #results > max_results then
+        for i = max_results + 1, #results do results[i] = nil end
+    end
+    return results
+end
+
+-- ----------------------------------------------------------------------
+-- Trigram similarity (conservative, no DB changes)
+-- ----------------------------------------------------------------------
+local trigram_cache = {}   -- word -> table of trigrams (keys = trigram, value = true)
+
+-- Generate trigrams for a word (pad with $ at both ends)
+local function get_trigrams(word)
+    if trigram_cache[word] then
+        return trigram_cache[word]
+    end
+    local trigrams = {}
+    local padded = "$" .. word .. "$"
+    for i = 1, #padded - 2 do
+        local tri = padded:sub(i, i+2)
+        trigrams[tri] = true
+    end
+    trigram_cache[word] = trigrams
+    return trigrams
+end
+
+-- Jaccard similarity = |A ∩ B| / |A ∪ B|
+local function jaccard_similarity(set1, set2)
+    local intersection = 0
+    local union = 0
+    -- count intersection by checking keys in set1 that exist in set2
+    for k, _ in pairs(set1) do
+        if set2[k] then
+            intersection = intersection + 1
+        end
+    end
+    -- union size = size(set1) + size(set2) - intersection
+    local size1 = 0
+    for _ in pairs(set1) do size1 = size1 + 1 end
+    local size2 = 0
+    for _ in pairs(set2) do size2 = size2 + 1 end
+    union = size1 + size2 - intersection
+    if union == 0 then return 0 end
+    return intersection / union
+end
+
+local function trigram_search(input, max_results)
+    local results = {}
+    local query_trigrams = get_trigrams(input:lower())
+    local cursor = conn:execute("SELECT word, definition, content_hash FROM dictionary")
+    local row = cursor:fetch({}, "a")
+    while row do
+        if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
+            local word_trigrams = get_trigrams(row.word:lower())
+            local sim = jaccard_similarity(query_trigrams, word_trigrams)
+            if sim > 0.2 then   -- threshold, can be tweaked
+                table.insert(results, { word = row.word, def = row.definition, score = sim })
+            end
+        end
+        row = cursor:fetch({}, "a")
+    end
+    cursor:close()
+    table.sort(results, function(a,b) return a.score > b.score end)  -- higher Jaccard = better
     if #results > max_results then
         for i = max_results + 1, #results do results[i] = nil end
     end
@@ -136,7 +198,7 @@ local function print_result(word, definition)
 end
 
 -- ----------------------------------------------------------------------
--- Database query functions
+-- Database query functions (unchanged except adding trigram calls where needed)
 -- ----------------------------------------------------------------------
 local function prefix_search(prefix)
     print_header("Words starting with '" .. prefix .. "':")
@@ -244,7 +306,7 @@ local function handle_html(word)
 end
 
 -- ----------------------------------------------------------------------
--- REPL
+-- REPL (added trigram command)
 -- ----------------------------------------------------------------------
 local function repl()
     print()
@@ -257,7 +319,8 @@ local function repl()
     print("  limit N     – set max results to N (e.g. limit 5)")
     print("  bad         – toggle exclusion of the known bad content_hash")
     print("  p:WORD      – prefix search (word completion)")
-    print("  f:WORD      – fuzzy search (typo‑tolerant)")
+    print("  f:WORD      – fuzzy search (typo‑tolerant, Levenshtein)")
+    print("  t:WORD      – trigram similarity search (Jaccard index)")
     print("  d:TEXT      – search inside definitions")
     print("  h:WORD      – output raw HTML (for piping to your dumper)")
     print("  WORD        – exact + prefix + fuzzy (combined)")
@@ -272,7 +335,7 @@ local function repl()
         elseif line == "q" or line == "quit" or line == "exit" then
             break
         elseif line == "?" then
-            print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, d:TEXT, h:WORD, WORD")
+            print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, t:WORD, d:TEXT, h:WORD, WORD")
         elseif line:sub(1,5) == "limit" then
             local n = tonumber(line:match("limit%s+(%d+)"))
             if n and n > 0 then
@@ -293,6 +356,13 @@ local function repl()
                 print_result(r.word, r.def)
             end
             if #fuzzy_results == 0 then print("(none)") end
+        elseif line:sub(1,2) == "t:" then
+            local trigram_results = trigram_search(line:sub(3), MAX_RESULTS)
+            print_header("Trigram matches for '" .. line:sub(3) .. "':")
+            for _, r in ipairs(trigram_results) do
+                print_result(r.word, r.def)
+            end
+            if #trigram_results == 0 then print("(none)") end
         elseif line:sub(1,2) == "d:" then
             definition_search(line:sub(3))
         elseif line:sub(1,2) == "h:" then
@@ -307,7 +377,7 @@ local function repl()
 end
 
 -- ----------------------------------------------------------------------
--- Parse command line
+-- Parse command line (added --trigram)
 -- ----------------------------------------------------------------------
 local function show_usage()
     print([[
@@ -318,7 +388,8 @@ Usage:
   lua latin.lua --exact "word"       → only exact match
   lua latin.lua --no-fuzzy "word"    → exact + prefix (no fuzzy)
   lua latin.lua --prefix "pref"      → list words starting with 'pref'
-  lua latin.lua --fuzzy "word"       → fuzzy search only
+  lua latin.lua --fuzzy "word"       → fuzzy search only (Levenshtein)
+  lua latin.lua --trigram "word"     → trigram similarity search (Jaccard)
   lua latin.lua --def "text"         → search inside definitions
   lua latin.lua --html "word"        → output raw HTML for that word
   lua latin.lua --exclude-bad        → exclude entries with the problematic content_hash
@@ -377,6 +448,13 @@ local function main(args)
             print_result(r.word, r.def)
         end
         if #fuzzy_results == 0 then print("(none)") end
+    elseif new_args[1] == "--trigram" and #new_args >= 2 then
+        local trigram_results = trigram_search(new_args[2], MAX_RESULTS)
+        print_header("Trigram matches for '" .. new_args[2] .. "':")
+        for _, r in ipairs(trigram_results) do
+            print_result(r.word, r.def)
+        end
+        if #trigram_results == 0 then print("(none)") end
     elseif new_args[1] == "--def" and #new_args >= 2 then
         definition_search(new_args[2])
     elseif new_args[1] == "--html" and #new_args >= 2 then
