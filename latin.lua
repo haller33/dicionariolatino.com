@@ -1,5 +1,5 @@
 #!/usr/bin/env lua
--- latin.lua – Latin dictionary searcher (with raw HTML and configurable limit)
+-- latin.lua – Latin dictionary searcher (with content_hash exclusion)
 
 local luasql = require("luasql.sqlite3")
 
@@ -7,7 +7,10 @@ local luasql = require("luasql.sqlite3")
 -- Config
 -- ----------------------------------------------------------------------
 local DB_PATH = "latin_portuguese.db"
-local MAX_RESULTS = 20           -- default limit
+local MAX_RESULTS = 20
+
+local BAD_CONTENT_HASH = "32aaccb0c4597738cc2fca23b28557802587b9a9fa91d5c8c54beae8aedee5d9"
+local exclude_bad = false
 
 -- ----------------------------------------------------------------------
 -- Helper: escape SQL string
@@ -15,6 +18,21 @@ local MAX_RESULTS = 20           -- default limit
 local function escape(s)
     if not s then return "" end
     return s:gsub("'", "''")
+end
+
+-- ----------------------------------------------------------------------
+-- Helper: add exclusion condition to WHERE clause
+-- ----------------------------------------------------------------------
+local function add_exclusion(where_clause)
+    if exclude_bad then
+        if where_clause and where_clause ~= "" then
+            return where_clause .. " AND content_hash != '" .. BAD_CONTENT_HASH .. "'"
+        else
+            return "content_hash != '" .. BAD_CONTENT_HASH .. "'"
+        end
+    else
+        return where_clause or ""
+    end
 end
 
 -- ----------------------------------------------------------------------
@@ -61,16 +79,19 @@ local function fuzzy_score(word, target)
     return dist / max_len
 end
 
+-- FIXED: no goto, simple conditional
 local function fuzzy_search(input, max_results)
     local results = {}
-    local cursor = conn:execute("SELECT word, definition FROM dictionary")
+    local cursor = conn:execute("SELECT word, definition, content_hash FROM dictionary")
     local row = cursor:fetch({}, "a")
     while row do
-        local score_word = fuzzy_score(row.word, input)
-        local score_def  = fuzzy_score(row.definition or "", input)
-        local best = math.min(score_word, score_def)
-        if best < 0.45 then
-            table.insert(results, { word = row.word, def = row.definition, score = best })
+        if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
+            local score_word = fuzzy_score(row.word, input)
+            local score_def  = fuzzy_score(row.definition or "", input)
+            local best = math.min(score_word, score_def)
+            if best < 0.45 then
+                table.insert(results, { word = row.word, def = row.definition, score = best })
+            end
         end
         row = cursor:fetch({}, "a")
     end
@@ -115,13 +136,14 @@ local function print_result(word, definition)
 end
 
 -- ----------------------------------------------------------------------
--- Database query functions (using the global MAX_RESULTS)
+-- Database query functions
 -- ----------------------------------------------------------------------
 local function prefix_search(prefix)
     print_header("Words starting with '" .. prefix .. "':")
     local count = 0
-    local sql = string.format("SELECT word FROM dictionary WHERE word LIKE '%s%%' LIMIT %d",
-                              escape(prefix), MAX_RESULTS)
+    local where = "word LIKE '" .. escape(prefix) .. "%'"
+    where = add_exclusion(where)
+    local sql = string.format("SELECT word FROM dictionary WHERE %s LIMIT %d", where, MAX_RESULTS)
     local cursor = conn:execute(sql)
     local row = cursor:fetch({}, "a")
     while row do
@@ -136,8 +158,9 @@ end
 local function definition_search(text)
     print_header("Definitions containing '" .. text .. "':")
     local count = 0
-    local sql = string.format("SELECT word, definition FROM dictionary WHERE definition LIKE '%%%s%%' LIMIT %d",
-                              escape(text), MAX_RESULTS)
+    local where = "definition LIKE '%" .. escape(text) .. "%'"
+    where = add_exclusion(where)
+    local sql = string.format("SELECT word, definition FROM dictionary WHERE %s LIMIT %d", where, MAX_RESULTS)
     local cursor = conn:execute(sql)
     local row = cursor:fetch({}, "a")
     while row do
@@ -151,7 +174,9 @@ end
 
 local function exact_search(query)
     print_header("Exact match for '" .. query .. "':")
-    local sql = string.format("SELECT word, definition FROM dictionary WHERE word = '%s'", escape(query))
+    local where = "word = '" .. escape(query) .. "'"
+    where = add_exclusion(where)
+    local sql = "SELECT word, definition FROM dictionary WHERE " .. where
     local cursor = conn:execute(sql)
     local row = cursor:fetch({}, "a")
     if row then
@@ -162,11 +187,11 @@ local function exact_search(query)
     cursor:close()
 end
 
-local function fuzzy_and_prefix_wrapper(query)
-    local fuzzy_list = fuzzy_search(query, MAX_RESULTS)
+local function fuzzy_and_prefix_wrapper(query, no_fuzzy)
     local prefix_list = {}
-    local sql = string.format("SELECT word FROM dictionary WHERE word LIKE '%s%%' LIMIT %d",
-                              escape(query), MAX_RESULTS)
+    local where = "word LIKE '" .. escape(query) .. "%'"
+    where = add_exclusion(where)
+    local sql = string.format("SELECT word FROM dictionary WHERE %s LIMIT %d", where, MAX_RESULTS)
     local cursor = conn:execute(sql)
     local row = cursor:fetch({}, "a")
     while row do
@@ -181,10 +206,15 @@ local function fuzzy_and_prefix_wrapper(query)
         print()
     end
 
-    if #fuzzy_list > 0 then
-        print_header("Fuzzy matches for '" .. query .. "':")
-        for _, r in ipairs(fuzzy_list) do
-            print_result(r.word, r.def)
+    if not no_fuzzy then
+        local fuzzy_list = fuzzy_search(query, MAX_RESULTS)
+        if #fuzzy_list > 0 then
+            print_header("Fuzzy matches for '" .. query .. "':")
+            for _, r in ipairs(fuzzy_list) do
+                print_result(r.word, r.def)
+            end
+        elseif #prefix_list == 0 then
+            print("Nothing found.")
         end
     elseif #prefix_list == 0 then
         print("Nothing found.")
@@ -195,7 +225,9 @@ end
 -- Raw HTML output
 -- ----------------------------------------------------------------------
 local function get_raw_html(word)
-    local sql = string.format("SELECT raw_html FROM dictionary WHERE word = '%s'", escape(word))
+    local where = "word = '" .. escape(word) .. "'"
+    where = add_exclusion(where)
+    local sql = "SELECT raw_html FROM dictionary WHERE " .. where
     local cursor = conn:execute(sql)
     local row = cursor:fetch({}, "a")
     cursor:close()
@@ -212,16 +244,18 @@ local function handle_html(word)
 end
 
 -- ----------------------------------------------------------------------
--- REPL (with limit command)
+-- REPL
 -- ----------------------------------------------------------------------
 local function repl()
     print()
     print_header("Latin Dictionary REPL (luasql.sqlite3)")
     print("Current result limit: " .. MAX_RESULTS)
+    print("Exclude bad content_hash: " .. tostring(exclude_bad))
     print("Commands:")
     print("  ?           – show this help")
     print("  q           – quit")
     print("  limit N     – set max results to N (e.g. limit 5)")
+    print("  bad         – toggle exclusion of the known bad content_hash")
     print("  p:WORD      – prefix search (word completion)")
     print("  f:WORD      – fuzzy search (typo‑tolerant)")
     print("  d:TEXT      – search inside definitions")
@@ -238,7 +272,7 @@ local function repl()
         elseif line == "q" or line == "quit" or line == "exit" then
             break
         elseif line == "?" then
-            print("Commands: ?, q, limit N, p:WORD, f:WORD, d:TEXT, h:WORD, WORD")
+            print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, d:TEXT, h:WORD, WORD")
         elseif line:sub(1,5) == "limit" then
             local n = tonumber(line:match("limit%s+(%d+)"))
             if n and n > 0 then
@@ -247,6 +281,9 @@ local function repl()
             else
                 print("Invalid limit. Use: limit N (positive integer)")
             end
+        elseif line == "bad" then
+            exclude_bad = not exclude_bad
+            print("Exclude bad content_hash: " .. tostring(exclude_bad))
         elseif line:sub(1,2) == "p:" then
             prefix_search(line:sub(3))
         elseif line:sub(1,2) == "f:" then
@@ -261,7 +298,7 @@ local function repl()
         elseif line:sub(1,2) == "h:" then
             handle_html(line:sub(3))
         else
-            fuzzy_and_prefix_wrapper(line)
+            fuzzy_and_prefix_wrapper(line, false)
         end
         print()
         io.write(colours.green .. "> " .. colours.reset)
@@ -270,27 +307,26 @@ local function repl()
 end
 
 -- ----------------------------------------------------------------------
--- Parse command line (including --limit)
+-- Parse command line
 -- ----------------------------------------------------------------------
 local function show_usage()
     print([[
 Usage:
   lua latin.lua                      → interactive REPL
   lua latin.lua --limit N "word"     → set limit to N for that search
-  lua latin.lua "word"               → exact + prefix + fuzzy (default limit)
+  lua latin.lua "word"               → exact + prefix + fuzzy (default)
+  lua latin.lua --exact "word"       → only exact match
+  lua latin.lua --no-fuzzy "word"    → exact + prefix (no fuzzy)
   lua latin.lua --prefix "pref"      → list words starting with 'pref'
-  lua latin.lua --fuzzy "word"       → fuzzy search (typo‑tolerant)
+  lua latin.lua --fuzzy "word"       → fuzzy search only
   lua latin.lua --def "text"         → search inside definitions
   lua latin.lua --html "word"        → output raw HTML for that word
-  lua latin.lua --limit N --prefix...
-  (--limit works with --prefix, --fuzzy, --def, and plain queries)
+  lua latin.lua --exclude-bad        → exclude entries with the problematic content_hash
 ]])
 end
 
 local function main(args)
     open_db()
-
-    -- check that the table exists
     local cursor = conn:execute("SELECT name FROM sqlite_master WHERE type='table' AND name='dictionary'")
     local row = cursor:fetch({}, "a")
     cursor:close()
@@ -300,25 +336,35 @@ local function main(args)
         os.exit(1)
     end
 
-    -- parse --limit if present
     local limit = MAX_RESULTS
+    local no_fuzzy = false
+    local exact_mode = false
     local new_args = {}
     local i = 1
     while i <= #args do
         if args[i] == "--limit" and i+1 <= #args then
             local n = tonumber(args[i+1])
-            if n and n > 0 then
+            if n and n >= 0 then
                 limit = n
             else
                 print("Invalid --limit value. Using default " .. MAX_RESULTS)
             end
-            i = i + 2   -- skip limit and its value
+            i = i + 2
+        elseif args[i] == "--no-fuzzy" then
+            no_fuzzy = true
+            i = i + 1
+        elseif args[i] == "--exact" then
+            exact_mode = true
+            i = i + 1
+        elseif args[i] == "--exclude-bad" then
+            exclude_bad = true
+            i = i + 1
         else
             table.insert(new_args, args[i])
             i = i + 1
         end
     end
-    MAX_RESULTS = limit   -- apply the limit for this run
+    MAX_RESULTS = limit
 
     if #new_args == 0 then
         repl()
@@ -338,8 +384,12 @@ local function main(args)
     elseif new_args[1] == "--help" or new_args[1] == "-h" then
         show_usage()
     else
-        -- treat first argument as a search query
-        fuzzy_and_prefix_wrapper(new_args[1])
+        local query = new_args[1]
+        if exact_mode then
+            exact_search(query)
+        else
+            fuzzy_and_prefix_wrapper(query, no_fuzzy)
+        end
     end
 
     close_db()
@@ -348,9 +398,7 @@ end
 -- run
 if pcall(require, "luasql.sqlite3") then
     local args = {}
-    for i = 1, #arg do
-        args[i] = arg[i]
-    end
+    for i = 1, #arg do args[i] = arg[i] end
     main(args)
 else
     print("Error: luasql.sqlite3 module not found.")
