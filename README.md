@@ -1,11 +1,15 @@
 # dicionariolatino.com
 
 [![Python Version](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)  
-A Python web scraper that extracts Latin–Portuguese definitions from [DicionarioLatino.com](https://dicionariolatino.com) and stores them in a local SQLite database.
+[![Lua Version](https://img.shields.io/badge/lua-5.1.4-blue.svg)](https://www.lua.org/)  
+
+A Python web scraper that extracts Latin–Portuguese definitions from [DicionarioLatino.com](https://dicionariolatino.com) and stores them in a local SQLite database – plus a **fast, offline Lua search tool** with prefix, fuzzy, trigram similarity, definition search, and raw HTML export.
 
 ## 📖 Project Overview
 
-This repository contains tools to scrape Latin word definitions from the online dictionary **DicionarioLatino.com**. The primary script, `scrap.py`, systematically queries a list of Latin words and saves the results into a structured SQLite database (`latin_portuguese.db`). This enables offline access, data analysis, or integration with other applications.
+This repository contains tools to scrape Latin word definitions from the online dictionary **DicionarioLatino.com**. The primary script, `scrap.py`, systematically queries a list of Latin words and saves the results into a structured SQLite database (`latin_portuguese.db`).  
+
+Additionally, a **single‑file Lua program** (`latin.lua`) provides a powerful command‑line interface and REPL to search the database locally. It runs on Lua 5.1.4 (including on a **Kindle**) and requires no compilation – just `luasql.sqlite3`.
 
 ## ✨ Features
 
@@ -14,20 +18,116 @@ This repository contains tools to scrape Latin word definitions from the online 
 - **SQLite Storage**: Stores definitions along with raw HTML and SHA-256 hashes for efficient duplicate avoidance.
 - **Resumable Operation**: Skips words already processed, allowing you to stop and restart the scraper without losing progress.
 - **Interactive Front-End**: Includes `custom.js` for a live search interface on a web page.
+- **Lua Search Tool** (new):
+  - **Exact, prefix, definition, fuzzy (Levenshtein) and trigram (Jaccard) search**
+  - **Raw HTML output** for piping into an HTML dumper
+  - **Interactive REPL** with coloured output and commands
+  - **Configurable result limit** (`--limit N` or `limit N` in REPL)
+  - **Exclusion of problematic content_hash** (`--exclude-bad` or `bad` in REPL)
+  - **Unix‑friendly CLI** – works in pipelines, respects `stdout` TTY detection
 
 ## 🗂️ Project Structure
 
-| File/Folder                  | Description                                                                 |
-|------------------------------|-----------------------------------------------------------------------------|
-| `scrap.py`                   | Main scraping script: fetches definitions and writes them to the database. |
-| `run.sh`                     | Shell script to execute `scrap.py` using `uv` with the `requests` dependency. |
-| `custom.js`                  | jQuery-powered live search for a web front-end.                  |
-| `latin_words_clean.txt`      | Cleaned list of Latin words to scrape.                         |
-| `latin_words.txt`            | Raw/extended list of Latin words (may contain duplicates).      |
-| `latin_portuguese.db`        | SQLite database (~25 MB) containing scraped definitions.       |
+| File/Folder                          | Description                                                                 |
+|--------------------------------------|-----------------------------------------------------------------------------|
+| `scrap.py`                           | Main scraping script: fetches definitions and writes them to the database. |
+| `run.sh`                             | Shell script to execute `scrap.py` using `uv` with the `requests` dependency. |
+| `custom.js`                          | jQuery-powered live search for a web front-end.                  |
+| `latin_words_clean.txt`              | Cleaned list of Latin words to scrape.                         |
+| `latin_words.txt`                    | Raw/extended list of Latin words (may contain duplicates).      |
+| `latin_portuguese.db`                | SQLite database (~25 MB) containing scraped definitions.       |
 | `source_primary_latin_words.plain_text.txt` | Large raw data file (approx. 21 MB).                    |
+| **`latin.lua`**                      | **Lua search client** – offline dictionary lookup with multiple search modes. |
 
-## ⚙️ How It Works
+## 🔍 Lua Search Client (`latin.lua`)
+
+### Requirements
+
+- Lua 5.1.4 (or later)
+- `luasql.sqlite3` – install via LuaRocks:  
+  `luarocks install luasql-sqlite3`  
+  *For Kindle*, place the compiled `.so`/`.dll` in the same folder as `latin.lua`.
+
+### Quick Start
+
+    # Interactive REPL
+    lua latin.lua
+
+    # One‑time search (Exact + prefix + fuzzy)
+    lua latin.lua "amor"
+
+    # Only exact match
+    lua latin.lua --exact "amor"
+
+    # Prefix only (word completion)
+    lua latin.lua --prefix "bell"
+
+    # Fuzzy search only (Levenshtein distance)
+    lua latin.lua --fuzzy "amr"
+
+    # Trigram similarity search (Jaccard index)
+    lua latin.lua --trigram "amar"
+
+    # Search inside Portuguese definitions
+    lua latin.lua --def "guerra"
+
+    # Output raw HTML
+    lua latin.lua --html "bellum"
+
+    # Exclude specific problematic hash (content_hash)
+    lua latin.lua --exclude-bad "amor"
+
+    # Combine flags (limit + exclude + no fuzzy)
+    lua latin.lua --limit 5 --exclude-bad --no-fuzzy "amo"
+
+### REPL Commands
+
+Inside the REPL (`lua latin.lua` without arguments):
+
+| Command          | Action                                                      |
+|------------------|-------------------------------------------------------------|
+| `?`              | Show help                                                   |
+| `q`              | Quit                                                        |
+| `limit N`        | Set maximum results to N (e.g. `limit 10`)                  |
+| `bad`            | Toggle exclusion of the problematic `content_hash`          |
+| `p:WORD`         | Prefix search (words starting with WORD)                    |
+| `f:WORD`         | Fuzzy search (Levenshtein)                                  |
+| `t:WORD`         | Trigram similarity search (Jaccard)                         |
+| `d:TEXT`         | Search inside definitions                                   |
+| `h:WORD`         | Output raw HTML for the word                                |
+| `WORD`           | Combined search (Exact + prefix + fuzzy)                    |
+
+Example REPL session:
+
+    $ lua latin.lua
+    Latin Dictionary REPL (luasql.sqlite3)
+    Current result limit: 20
+    Exclude bad content_hash: false
+
+    > p:am
+    Words starting with 'am':
+     • am
+     • ama
+     • amamus
+     ...
+
+    > t:amor
+    Trigram matches for 'amor':
+    amor: sentimento de afeição, amor...
+    amoris: do amor...
+
+    > bad
+    Exclude bad content_hash: true
+
+    > limit 5
+    Result limit set to 5
+
+### Output Control
+
+- **Colours** are automatically disabled when output is redirected to a file or pipe.
+- **Raw HTML** (`--html` or `h:`) prints exactly the stored HTML – perfect for piping into your own HTML dumper (e.g. [lua-html-dump](https://github.com/haller33/lua-html-dump)).
+
+## ⚙️ How the Scraper Works
 
 1. **Word List Loading**: The script reads `latin_words_clean.txt` (or a custom file) into memory.
 2. **Hashing**: Each word is hashed with SHA-256 to create a unique identifier.
@@ -37,7 +137,7 @@ This repository contains tools to scrape Latin word definitions from the online 
 6. **Database Insertion**: The cleaned definition, raw HTML, and hashes are inserted into the `dictionary` table.
 7. **Rate Limiting**: A 5‑second delay between requests prevents overloading the dictionary server.
 
-## 🚀 Usage
+## 🚀 Usage (Scraper)
 
 ### Prerequisites
 - Python 3.x
@@ -46,19 +146,15 @@ This repository contains tools to scrape Latin word definitions from the online 
 ### Installation & Execution
 
 1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/haller33/dicionariolatino.com.git
-   cd dicionariolatino.com
-   ```
+       git clone https://github.com/haller33/dicionariolatino.com.git
+       cd dicionariolatino.com
 
 2. **Install dependencies** (if not using `uv`):
-   ```bash
-   pip install requests
-   ```
+       pip install requests
 
 3. **Run the scraper**:
-   - Using `uv` (recommended): `sh run.sh`
-   - Using Python directly: `python scrap.py`
+    - Using `uv` (recommended): `sh run.sh`
+    - Using Python directly: `python scrap.py`
 
 The script will begin processing words and print status updates. The database `latin_portuguese.db` will be created/updated in the same directory.
 
@@ -67,10 +163,14 @@ Simply re-run the script. It checks existing word hashes and only processes miss
 
 ## 📦 Dependencies
 
+### For the scraper (Python)
 - `requests` – HTTP library for submitting search queries.
 - `sqlite3` – Built‑in Python module for database operations.
 - `hashlib` – Built‑in module for SHA‑256 hashing.
 - `re` and `html` – For cleaning and unescaping HTML content.
+
+### For the Lua search client
+- `luasql.sqlite3` – SQLite bindings for Lua.
 
 ## ⚠️ Disclaimer
 
@@ -83,8 +183,8 @@ MIT License
 ## 🙏 Acknowledgments
 
 - Data source: [DicionarioLatino.com](https://dicionariolatino.com)
-- Built with Python
+- Built with Python and Lua
 
 ---
 
-*Happy scraping!*
+*Happy scraping and searching!*
