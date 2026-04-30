@@ -1,84 +1,60 @@
 #!/usr/bin/env lua
--- latin.lua – Universal Latin dictionary searcher
--- Works with luasql.sqlite3 (Nix) or native sqlite3 (Kindle)
+-- latin.lua – Kindle version using external sqlite3 (robust pipe-separated parsing)
 
 local DB_PATH = "latin_portuguese.db"
+local SQLITE_BIN = "sqlite3"   -- or "./sqlite3" if local
 local MAX_RESULTS = 20
 local BAD_CONTENT_HASH = "32aaccb0c4597738cc2fca23b28557802587b9a9fa91d5c8c54beae8aedee5d9"
 local exclude_bad = false
 
 -- ----------------------------------------------------------------------
--- Dynamic module loading and API abstraction
+-- Execute SQL and return rows as array of tables (using -list mode)
 -- ----------------------------------------------------------------------
-local db
-local query_rows  -- function that takes SQL and returns a table of rows (each row is a table)
-local query_one    -- function for single row (exact match / HTML)
+local function sql_query(sql)
+    local cmd = string.format('%s -list -separator "|" -header "%s" "%s"',
+                              SQLITE_BIN, DB_PATH, sql:gsub('"', '\\"'))
+    local handle = io.popen(cmd, "r")
+    if not handle then return {} end
 
--- Try luasql.sqlite3 first (Nix)
-local ok, luasql = pcall(require, "luasql.sqlite3")
-if ok then
-    -- Use luasql.sqlite3
-    local env = luasql.sqlite3()
-    db = env:connect(DB_PATH)
-    if not db then error("Cannot connect to " .. DB_PATH) end
-
-    query_rows = function(sql)
-        local cursor = db:execute(sql)
-        local rows = {}
-        local row = cursor:fetch({}, "a")
-        while row do
-            table.insert(rows, row)
-            row = cursor:fetch({}, "a")
-        end
-        cursor:close()
-        return rows
-    end
-
-    query_one = function(sql)
-        local cursor = db:execute(sql)
-        local row = cursor:fetch({}, "a")
-        cursor:close()
-        return row
-    end
-else
-    -- Fall back to sqlite3 (Kindle)
-    local sqlite3 = require("sqlite3")
-    db = sqlite3.open(DB_PATH)
-    if not db then error("Cannot open " .. DB_PATH) end
-
-    query_rows = function(sql)
-        local rows = {}
-        for row in db:nrows(sql) do
-            table.insert(rows, row)
-        end
-        return rows
-    end
-
-    query_one = function(sql)
-        local stmt = db:prepare(sql)
-        local row = nil
-        if stmt:step() == sqlite3.ROW then
-            row = {}
-            for i = 0, stmt:column_count() - 1 do
-                row[stmt:column_name(i)] = stmt:get_value(i)
+    local rows = {}
+    local headers = nil
+    for line in handle:lines() do
+        if headers == nil then
+            -- First line: header names separated by '|'
+            headers = {}
+            for col in line:gmatch("[^|]+") do
+                table.insert(headers, col)
             end
+        else
+            -- Data line: values separated by '|'
+            local row = {}
+            local idx = 1
+            for value in line:gmatch("[^|]+") do
+                if headers[idx] then
+                    row[headers[idx]] = value
+                end
+                idx = idx + 1
+            end
+            table.insert(rows, row)
         end
-        stmt:finalize()
-        return row
     end
+    handle:close()
+    return rows
+end
+
+local function sql_query_one(sql)
+    local rows = sql_query(sql)
+    return rows[1]
 end
 
 -- ----------------------------------------------------------------------
--- Helper: escape SQL string
+-- Helpers (unchanged)
 -- ----------------------------------------------------------------------
 local function escape(s)
     if not s then return "" end
     return s:gsub("'", "''")
 end
 
--- ----------------------------------------------------------------------
--- Helper: add exclusion condition to WHERE clause
--- ----------------------------------------------------------------------
 local function add_exclusion(where_clause)
     if exclude_bad then
         if where_clause and where_clause ~= "" then
@@ -92,7 +68,7 @@ local function add_exclusion(where_clause)
 end
 
 -- ----------------------------------------------------------------------
--- Fuzzy matching (Levenshtein distance)
+-- Fuzzy & Trigram (identical to before)
 -- ----------------------------------------------------------------------
 local function levenshtein(s, t)
     local m, n = #s, #t
@@ -120,7 +96,7 @@ end
 
 local function fuzzy_search(input, max_results)
     local results = {}
-    local rows = query_rows("SELECT word, definition, content_hash FROM dictionary")
+    local rows = sql_query("SELECT word, definition, content_hash FROM dictionary")
     for _, row in ipairs(rows) do
         if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
             local score_word = fuzzy_score(row.word, input)
@@ -138,15 +114,10 @@ local function fuzzy_search(input, max_results)
     return results
 end
 
--- ----------------------------------------------------------------------
--- Trigram similarity
--- ----------------------------------------------------------------------
+-- Trigram cache
 local trigram_cache = {}
-
 local function get_trigrams(word)
-    if trigram_cache[word] then
-        return trigram_cache[word]
-    end
+    if trigram_cache[word] then return trigram_cache[word] end
     local trigrams = {}
     local padded = "$" .. word .. "$"
     for i = 1, #padded - 2 do
@@ -159,13 +130,10 @@ end
 
 local function jaccard_similarity(set1, set2)
     local intersection = 0
-    for k, _ in pairs(set1) do
-        if set2[k] then
-            intersection = intersection + 1
-        end
-    end
-    local size1 = 0; for _ in pairs(set1) do size1 = size1 + 1 end
-    local size2 = 0; for _ in pairs(set2) do size2 = size2 + 1 end
+    for k,_ in pairs(set1) do if set2[k] then intersection = intersection + 1 end end
+    local size1, size2 = 0, 0
+    for _ in pairs(set1) do size1 = size1 + 1 end
+    for _ in pairs(set2) do size2 = size2 + 1 end
     local union = size1 + size2 - intersection
     if union == 0 then return 0 end
     return intersection / union
@@ -174,7 +142,7 @@ end
 local function trigram_search(input, max_results)
     local results = {}
     local query_trigrams = get_trigrams(input:lower())
-    local rows = query_rows("SELECT word, definition, content_hash FROM dictionary")
+    local rows = sql_query("SELECT word, definition, content_hash FROM dictionary")
     for _, row in ipairs(rows) do
         if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
             local word_trigrams = get_trigrams(row.word:lower())
@@ -206,32 +174,24 @@ local colours = stdout_is_tty() and {
     yellow = "\27[33m",
     cyan   = "\27[36m",
     reset  = "\27[0m"
-} or {
-    bold = "", green = "", yellow = "", cyan = "", reset = ""
-}
+} or { bold="", green="", yellow="", cyan="", reset="" }
 
-local function print_header(title)
-    print(colours.bold .. colours.green .. title .. colours.reset)
-end
-
+local function print_header(title) print(colours.bold..colours.green..title..colours.reset) end
 local function print_result(word, definition)
-    io.write(colours.cyan .. word .. colours.reset, ": ")
-    if definition and #definition > 0 then
-        print(definition:gsub("\n", " "))
-    else
-        print("(no definition)")
-    end
+    io.write(colours.cyan..word..colours.reset, ": ")
+    if definition and #definition>0 then print(definition:gsub("\n"," "))
+    else print("(no definition)") end
 end
 
 -- ----------------------------------------------------------------------
--- Database query functions (using the abstraction)
+-- Search functions (using the fixed sql_query)
 -- ----------------------------------------------------------------------
 local function prefix_search(prefix)
-    print_header("Words starting with '" .. prefix .. "':")
-    local where = "word LIKE '" .. escape(prefix) .. "%'"
+    print_header("Words starting with '"..prefix.."':")
+    local where = "word LIKE '"..escape(prefix).."%'"
     where = add_exclusion(where)
     local sql = string.format("SELECT word FROM dictionary WHERE %s LIMIT %d", where, MAX_RESULTS)
-    local rows = query_rows(sql)
+    local rows = sql_query(sql)
     if #rows == 0 then
         print("(none)")
     else
@@ -242,11 +202,11 @@ local function prefix_search(prefix)
 end
 
 local function definition_search(text)
-    print_header("Definitions containing '" .. text .. "':")
-    local where = "definition LIKE '%" .. escape(text) .. "%'"
+    print_header("Definitions containing '"..text.."':")
+    local where = "definition LIKE '%"..escape(text).."%'"
     where = add_exclusion(where)
     local sql = string.format("SELECT word, definition FROM dictionary WHERE %s LIMIT %d", where, MAX_RESULTS)
-    local rows = query_rows(sql)
+    local rows = sql_query(sql)
     if #rows == 0 then
         print("(none)")
     else
@@ -257,11 +217,10 @@ local function definition_search(text)
 end
 
 local function exact_search(query)
-    print_header("Exact match for '" .. query .. "':")
-    local where = "word = '" .. escape(query) .. "'"
+    print_header("Exact match for '"..query.."':")
+    local where = "word = '"..escape(query).."'"
     where = add_exclusion(where)
-    local sql = "SELECT word, definition FROM dictionary WHERE " .. where
-    local row = query_one(sql)
+    local row = sql_query_one("SELECT word, definition FROM dictionary WHERE "..where)
     if row then
         print_result(row.word, row.definition)
     else
@@ -270,25 +229,25 @@ local function exact_search(query)
 end
 
 local function fuzzy_and_prefix_wrapper(query, no_fuzzy)
-    local where = "word LIKE '" .. escape(query) .. "%'"
+    local where = "word LIKE '"..escape(query).."%'"
     where = add_exclusion(where)
     local sql = string.format("SELECT word FROM dictionary WHERE %s LIMIT %d", where, MAX_RESULTS)
-    local prefix_rows = query_rows(sql)
+    local prefix_rows = sql_query(sql)
     local prefix_list = {}
     for _, row in ipairs(prefix_rows) do
         table.insert(prefix_list, row.word)
     end
 
     if #prefix_list > 0 then
-        print_header("Prefix matches for '" .. query .. "':")
-        for _, w in ipairs(prefix_list) do print(" • " .. w) end
+        print_header("Prefix matches for '"..query.."':")
+        for _, w in ipairs(prefix_list) do print(" • "..w) end
         print()
     end
 
     if not no_fuzzy then
         local fuzzy_list = fuzzy_search(query, MAX_RESULTS)
         if #fuzzy_list > 0 then
-            print_header("Fuzzy matches for '" .. query .. "':")
+            print_header("Fuzzy matches for '"..query.."':")
             for _, r in ipairs(fuzzy_list) do
                 print_result(r.word, r.def)
             end
@@ -300,84 +259,58 @@ local function fuzzy_and_prefix_wrapper(query, no_fuzzy)
     end
 end
 
--- ----------------------------------------------------------------------
--- Raw HTML output
--- ----------------------------------------------------------------------
 local function get_raw_html(word)
-    local where = "word = '" .. escape(word) .. "'"
+    local where = "word = '"..escape(word).."'"
     where = add_exclusion(where)
-    local sql = "SELECT raw_html FROM dictionary WHERE " .. where
-    local row = query_one(sql)
+    local row = sql_query_one("SELECT raw_html FROM dictionary WHERE "..where)
     if row and row.raw_html then
         print(row.raw_html)
     else
-        io.stderr:write("No HTML content found for word: " .. word .. "\n")
+        io.stderr:write("No HTML content found for word: "..word.."\n")
         os.exit(1)
     end
 end
-
-local function handle_html(word)
-    get_raw_html(word)
-end
+local function handle_html(word) get_raw_html(word) end
 
 -- ----------------------------------------------------------------------
 -- REPL
 -- ----------------------------------------------------------------------
 local function repl()
     print()
-    print_header("Latin Dictionary REPL (universal)")
-    print("Current result limit: " .. MAX_RESULTS)
-    print("Exclude bad content_hash: " .. tostring(exclude_bad))
-    print("Commands:")
-    print("  ?           – show this help")
-    print("  q           – quit")
-    print("  limit N     – set max results to N (e.g. limit 5)")
-    print("  bad         – toggle exclusion of the known bad content_hash")
-    print("  p:WORD      – prefix search (word completion)")
-    print("  f:WORD      – fuzzy search (typo‑tolerant, Levenshtein)")
-    print("  t:WORD      – trigram similarity search (Jaccard index)")
-    print("  d:TEXT      – search inside definitions")
-    print("  h:WORD      – output raw HTML (for piping to your dumper)")
-    print("  WORD        – exact + prefix + fuzzy (combined)")
-    print()
-    io.write(colours.green .. "> " .. colours.reset)
-    io.flush()
+    print_header("Latin Dictionary REPL (sqlite3 CLI)")
+    print("Current limit: "..MAX_RESULTS.."  Exclude bad: "..tostring(exclude_bad))
+    print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, t:WORD, d:TEXT, h:WORD, WORD")
+    io.write(colours.green.."> "..colours.reset); io.flush()
 
     for line in io.lines() do
         line = line:match("^%s*(.-)%s*$")
         if line == "" then
-            -- skip
-        elseif line == "q" or line == "quit" or line == "exit" then
-            break
+        elseif line == "q" or line == "quit" then break
         elseif line == "?" then
             print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, t:WORD, d:TEXT, h:WORD, WORD")
         elseif line:sub(1,5) == "limit" then
             local n = tonumber(line:match("limit%s+(%d+)"))
             if n and n > 0 then
                 MAX_RESULTS = n
-                print("Result limit set to " .. MAX_RESULTS)
+                print("Limit set to "..MAX_RESULTS)
             else
-                print("Invalid limit. Use: limit N (positive integer)")
+                print("Invalid limit")
             end
         elseif line == "bad" then
             exclude_bad = not exclude_bad
-            print("Exclude bad content_hash: " .. tostring(exclude_bad))
+            print("Exclude bad: "..tostring(exclude_bad))
         elseif line:sub(1,2) == "p:" then
             prefix_search(line:sub(3))
         elseif line:sub(1,2) == "f:" then
-            local fuzzy_results = fuzzy_search(line:sub(3), MAX_RESULTS)
-            print_header("Fuzzy matches for '" .. line:sub(3) .. "':")
-            for _, r in ipairs(fuzzy_results) do
-                print_result(r.word, r.def)
-            end
-            if #fuzzy_results == 0 then print("(none)") end
+            local res = fuzzy_search(line:sub(3), MAX_RESULTS)
+            print_header("Fuzzy matches for '"..line:sub(3).."':")
+            for _, r in ipairs(res) do print_result(r.word, r.def) end
+            if #res == 0 then print("(none)") end
         elseif line:sub(1,2) == "t:" then
-            local trigram_results = trigram_search(line:sub(3), MAX_RESULTS)
-            print_header("Trigram matches for '" .. line:sub(3) .. "':")
-            for _, r in ipairs(trigram_results) do
-                print_result(r.word, r.def)
-            end
-            if #trigram_results == 0 then print("(none)") end
+            local res = trigram_search(line:sub(3), MAX_RESULTS)
+            print_header("Trigram matches for '"..line:sub(3).."':")
+            for _, r in ipairs(res) do print_result(r.word, r.def) end
+            if #res == 0 then print("(none)") end
         elseif line:sub(1,2) == "d:" then
             definition_search(line:sub(3))
         elseif line:sub(1,2) == "h:" then
@@ -386,36 +319,43 @@ local function repl()
             fuzzy_and_prefix_wrapper(line, false)
         end
         print()
-        io.write(colours.green .. "> " .. colours.reset)
-        io.flush()
+        io.write(colours.green.."> "..colours.reset); io.flush()
     end
 end
 
 -- ----------------------------------------------------------------------
--- Parse command line (unchanged)
+-- Command line
 -- ----------------------------------------------------------------------
 local function show_usage()
     print([[
 Usage:
-  lua latin.lua                      → interactive REPL
-  lua latin.lua --limit N "word"     → set limit to N for that search
-  lua latin.lua "word"               → exact + prefix + fuzzy (default)
-  lua latin.lua --exact "word"       → only exact match
-  lua latin.lua --no-fuzzy "word"    → exact + prefix (no fuzzy)
-  lua latin.lua --prefix "pref"      → list words starting with 'pref'
-  lua latin.lua --fuzzy "word"       → fuzzy search only (Levenshtein)
-  lua latin.lua --trigram "word"     → trigram similarity search (Jaccard)
-  lua latin.lua --def "text"         → search inside definitions
-  lua latin.lua --html "word"        → output raw HTML for that word
-  lua latin.lua --exclude-bad        → exclude entries with the problematic content_hash
+  lua latin.lua                      REPL
+  lua latin.lua "word"               default search
+  lua latin.lua --exact "word"
+  lua latin.lua --no-fuzzy "word"
+  lua latin.lua --prefix "pref"
+  lua latin.lua --fuzzy "word"
+  lua latin.lua --trigram "word"
+  lua latin.lua --def "text"
+  lua latin.lua --html "word"
+  lua latin.lua --limit N ...
+  lua latin.lua --exclude-bad
 ]])
 end
 
 local function main(args)
-    -- check that the table exists
-    local row = query_one("SELECT name FROM sqlite_master WHERE type='table' AND name='dictionary'")
-    if not row then
-        print("Error: 'dictionary' table not found.")
+    -- Test sqlite3 binary
+    local test = io.popen(SQLITE_BIN.." --version 2>/dev/null", "r")
+    if not test then
+        print("Error: sqlite3 command not found. Please install sqlite3 or adjust SQLITE_BIN.")
+        os.exit(1)
+    end
+    test:close()
+
+    -- Verify DB and table
+    local check = sql_query_one("SELECT name FROM sqlite_master WHERE type='table' AND name='dictionary'")
+    if not check then
+        print("Error: 'dictionary' table not found. Wrong database?")
         os.exit(1)
     end
 
@@ -427,11 +367,7 @@ local function main(args)
     while i <= #args do
         if args[i] == "--limit" and i+1 <= #args then
             local n = tonumber(args[i+1])
-            if n and n >= 0 then
-                limit = n
-            else
-                print("Invalid --limit value. Using default " .. MAX_RESULTS)
-            end
+            if n and n >= 0 then limit = n end
             i = i + 2
         elseif args[i] == "--no-fuzzy" then
             no_fuzzy = true
@@ -454,19 +390,15 @@ local function main(args)
     elseif new_args[1] == "--prefix" and #new_args >= 2 then
         prefix_search(new_args[2])
     elseif new_args[1] == "--fuzzy" and #new_args >= 2 then
-        local fuzzy_results = fuzzy_search(new_args[2], MAX_RESULTS)
-        print_header("Fuzzy matches for '" .. new_args[2] .. "':")
-        for _, r in ipairs(fuzzy_results) do
-            print_result(r.word, r.def)
-        end
-        if #fuzzy_results == 0 then print("(none)") end
+        local res = fuzzy_search(new_args[2], MAX_RESULTS)
+        print_header("Fuzzy matches for '"..new_args[2].."':")
+        for _, r in ipairs(res) do print_result(r.word, r.def) end
+        if #res == 0 then print("(none)") end
     elseif new_args[1] == "--trigram" and #new_args >= 2 then
-        local trigram_results = trigram_search(new_args[2], MAX_RESULTS)
-        print_header("Trigram matches for '" .. new_args[2] .. "':")
-        for _, r in ipairs(trigram_results) do
-            print_result(r.word, r.def)
-        end
-        if #trigram_results == 0 then print("(none)") end
+        local res = trigram_search(new_args[2], MAX_RESULTS)
+        print_header("Trigram matches for '"..new_args[2].."':")
+        for _, r in ipairs(res) do print_result(r.word, r.def) end
+        if #res == 0 then print("(none)") end
     elseif new_args[1] == "--def" and #new_args >= 2 then
         definition_search(new_args[2])
     elseif new_args[1] == "--html" and #new_args >= 2 then
@@ -483,7 +415,6 @@ local function main(args)
     end
 end
 
--- run
 local args = {}
 for i = 1, #arg do args[i] = arg[i] end
 main(args)
