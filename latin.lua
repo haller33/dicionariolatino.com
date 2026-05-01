@@ -2,7 +2,7 @@
 -- latin.lua – Universal Latin dictionary searcher
 -- Works with luasql.sqlite3 (Nix) or native sqlite3 (Kindle)
 
-local DB_PATH = "latin_portuguese.db"
+local DB_PATH = "latin_portuguese.4accb9e9ffd47e0856d7d7957f6548cbe531d8701d42c211431f746e6c2ada8a.db"
 local MAX_RESULTS = 20
 local BAD_CONTENT_HASH = "32aaccb0c4597738cc2fca23b28557802587b9a9fa91d5c8c54beae8aedee5d9"
 local exclude_bad = false
