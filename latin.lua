@@ -10,6 +10,7 @@ local C_LIB_PATH = "bin/fuzzy.so"
 local use_c_fuzzy = true
 local MAX_FUZZY_C_THRESHOLD_LEVENSHTEIN = 0.45
 
+local verbose = false -- or true
 -- ----------------------------------------------------------------------
 -- Dynamic module loading and API abstraction
 -- ----------------------------------------------------------------------
@@ -97,7 +98,8 @@ end
 -- OPTIONAL C LIBRARY ACCELERATION
 -- ----------------------------------------------------------------------
 local fuzzy_c = nil
-local c_metadata_cache = {} -- Maps word -> {definition, hash}
+local c_metadata_cache = {}      -- Maps word -> {definition, hash}
+local c_def_to_word = {}         -- Maps definition text -> word (for C search results
 
 local function load_fuzzy_c()
     local dir = C_LIB_PATH:match("(.*)/") or "."
@@ -115,23 +117,38 @@ local function init_c_fuzzy()
         return false
     end
 
+    -- 1. Initialise word index
     local words = {}
+    local definitions = {}   -- table of definition strings, parallel to words for C index
     local sql = "SELECT word, definition, word_hash FROM dictionary"
     local cursor = db:execute(sql)
     local row = cursor:fetch({}, "a")
     while row do
         table.insert(words, row.word)
-        -- Store metadata to satisfy the original script's output contract
+        table.insert(definitions, row.definition or "")
         c_metadata_cache[row.word] = { definition = row.definition, hash = row.word_hash }
+        -- Build reverse map from definition to word (use first occurrence if duplicate)
+        if not c_def_to_word[row.definition] then
+            c_def_to_word[row.definition] = row.word
+        end
         row = cursor:fetch({}, "a")
     end
     cursor:close()
 
-    if fuzzy_c.init(words) then
-        if verbose then print("C fuzzy search initialized with " .. #words .. " words") end
-        return true
+    if not fuzzy_c.init(words) then
+        return false
     end
-    return false
+
+    -- 2. Initialise definition index (C library must have init_defs)
+    if fuzzy_c.init_defs then
+        fuzzy_c.init_defs(definitions)
+    else
+        -- If the C library was compiled without definition support, fall back quietly
+        if verbose then print("C definition search not available (missing init_defs)") end
+    end
+
+    if verbose then print("C fuzzy search initialized with " .. #words .. " words") end
+    return true
 end
 
 -- ----------------------------------------------------------------------
@@ -185,6 +202,7 @@ local function fuzzy_search(input, max_results)
         return results
     end
 
+    -- Fallback to pure Lua (original implementation)
     local rows = query_rows("SELECT word, definition, content_hash FROM dictionary")
     for _, row in ipairs(rows) do
         if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
@@ -193,6 +211,55 @@ local function fuzzy_search(input, max_results)
             local best = math.min(score_word, score_def)
             if best < 0.45 then
                 table.insert(results, { word = row.word, def = row.definition, score = best })
+            end
+        end
+    end
+    table.sort(results, function(a,b) return a.score < b.score end)
+    if #results > max_results then
+        for i = max_results + 1, #results do results[i] = nil end
+    end
+    return results
+end
+
+-- ----------------------------------------------------------------------
+-- Fuzzy search inside definitions only
+-- ----------------------------------------------------------------------
+local function fuzzy_definition_search(input, max_results)
+    local results = {}
+
+    -- Branch: use C library for definitions if available
+    if use_c_fuzzy and fuzzy_c and fuzzy_c.search_def then
+        local c_results = fuzzy_c.search_def(input, max_results)
+        for _, r in ipairs(c_results) do
+            local def_text = r.word   -- the field name is "word" for compatibility
+            local max_len = math.max(#input, #def_text)
+            local score = (max_len > 0) and (r.score / max_len) or 1
+            if score < 0.45 then
+                local word = c_def_to_word[def_text]
+                if word then
+                    local meta = c_metadata_cache[word]
+                    table.insert(results, {
+                        word = word,
+                        def = def_text,
+                        score = score,
+                        hash = meta and meta.hash or ""
+                    })
+                end
+            end
+        end
+        return results
+    end
+
+    -- Fallback to pure Lua (original implementation)
+    local rows = query_rows("SELECT word, definition, content_hash FROM dictionary")
+    for _, row in ipairs(rows) do
+        if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
+            local def = row.definition or ""
+            if def ~= "" then
+                local score = fuzzy_score(def, input)
+                if score < 0.45 then
+                    table.insert(results, { word = row.word, def = def, score = score })
+                end
             end
         end
     end
@@ -401,7 +468,8 @@ local function repl()
     print("  p:WORD      – prefix search (word completion)")
     print("  f:WORD      – fuzzy search (typo‑tolerant, Levenshtein)")
     print("  t:WORD      – trigram similarity search (Jaccard index)")
-    print("  d:TEXT      – search inside definitions")
+    print("  d:TEXT      – search inside definitions (exact substring)")
+    print("  df:TEXT     – fuzzy search inside definitions (typo‑tolerant)")
     print("  h:WORD      – output raw HTML (for piping to your dumper)")
     print("  WORD        – exact + prefix + fuzzy (combined)")
     print()
@@ -415,7 +483,7 @@ local function repl()
         elseif line == "q" or line == "quit" or line == "exit" then
             break
         elseif line == "?" then
-            print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, t:WORD, d:TEXT, h:WORD, WORD")
+            print("Commands: ?, q, limit N, bad, p:WORD, f:WORD, t:WORD, d:TEXT, df:TEXT, h:WORD, WORD")
         elseif line:sub(1,5) == "limit" then
             local n = tonumber(line:match("limit%s+(%d+)"))
             if n and n > 0 then
@@ -445,6 +513,13 @@ local function repl()
             if #trigram_results == 0 then print("(none)") end
         elseif line:sub(1,2) == "d:" then
             definition_search(line:sub(3))
+        elseif line:sub(1,3) == "df:" then
+            local fuzzy_def_results = fuzzy_definition_search(line:sub(4), MAX_RESULTS)
+            print_header("Fuzzy definition matches for '" .. line:sub(4) .. "':")
+            for _, r in ipairs(fuzzy_def_results) do
+                print_result(r.word, r.def)
+            end
+            if #fuzzy_def_results == 0 then print("(none)") end
         elseif line:sub(1,2) == "h:" then
             handle_html(line:sub(3))
         else
@@ -470,7 +545,8 @@ Usage:
   lua latin.lua --prefix "pref"      → list words starting with 'pref'
   lua latin.lua --fuzzy "word"       → fuzzy search only (Levenshtein)
   lua latin.lua --trigram "word"     → trigram similarity search (Jaccard)
-  lua latin.lua --def "text"         → search inside definitions
+  lua latin.lua --def "text"         → search inside definitions (exact substring)
+  lua latin.lua --def-fuzzy "text"   → fuzzy search inside definitions
   lua latin.lua --html "word"        → output raw HTML for that word
   lua latin.lua --exclude-bad        → exclude entries with the problematic content_hash
 ]])
@@ -536,6 +612,13 @@ local function main(args)
         if #trigram_results == 0 then print("(none)") end
     elseif new_args[1] == "--def" and #new_args >= 2 then
         definition_search(new_args[2])
+    elseif new_args[1] == "--def-fuzzy" and #new_args >= 2 then
+        local fuzzy_def_results = fuzzy_definition_search(new_args[2], MAX_RESULTS)
+        print_header("Fuzzy definition matches for '" .. new_args[2] .. "':")
+        for _, r in ipairs(fuzzy_def_results) do
+            print_result(r.word, r.def)
+        end
+        if #fuzzy_def_results == 0 then print("(none)") end
     elseif new_args[1] == "--html" and #new_args >= 2 then
         handle_html(new_args[2])
     elseif new_args[1] == "--help" or new_args[1] == "-h" then
