@@ -6,6 +6,9 @@ local DB_PATH = "latin_portuguese.4accb9e9ffd47e0856d7d7957f6548cbe531d8701d42c2
 local MAX_RESULTS = 20
 local BAD_CONTENT_HASH = "32aaccb0c4597738cc2fca23b28557802587b9a9fa91d5c8c54beae8aedee5d9"
 local exclude_bad = false
+local C_LIB_PATH = "bin/fuzzy.so"
+local use_c_fuzzy = true
+local MAX_FUZZY_C_THRESHOLD_LEVENSHTEIN = 0.45
 
 -- ----------------------------------------------------------------------
 -- Dynamic module loading and API abstraction
@@ -90,6 +93,46 @@ local function add_exclusion(where_clause)
         return where_clause or ""
     end
 end
+-- ----------------------------------------------------------------------
+-- OPTIONAL C LIBRARY ACCELERATION
+-- ----------------------------------------------------------------------
+local fuzzy_c = nil
+local c_metadata_cache = {} -- Maps word -> {definition, hash}
+
+local function load_fuzzy_c()
+    local dir = C_LIB_PATH:match("(.*)/") or "."
+    local orig_cpath = package.cpath
+    package.cpath = dir .. "/?.so;" .. dir .. "/?.dll;" .. orig_cpath
+    local ok, lib = pcall(require, "fuzzy")
+    package.cpath = orig_cpath
+    return ok and lib or nil
+end
+
+local function init_c_fuzzy()
+    fuzzy_c = load_fuzzy_c()
+    if not fuzzy_c then
+        if verbose then io.stderr:write("Warning: C fuzzy library not found at " .. C_LIB_PATH .. "\n") end
+        return false
+    end
+
+    local words = {}
+    local sql = "SELECT word, definition, word_hash FROM dictionary"
+    local cursor = db:execute(sql)
+    local row = cursor:fetch({}, "a")
+    while row do
+        table.insert(words, row.word)
+        -- Store metadata to satisfy the original script's output contract
+        c_metadata_cache[row.word] = { definition = row.definition, hash = row.word_hash }
+        row = cursor:fetch({}, "a")
+    end
+    cursor:close()
+
+    if fuzzy_c.init(words) then
+        if verbose then print("C fuzzy search initialized with " .. #words .. " words") end
+        return true
+    end
+    return false
+end
 
 -- ----------------------------------------------------------------------
 -- Fuzzy matching (Levenshtein distance)
@@ -120,6 +163,28 @@ end
 
 local function fuzzy_search(input, max_results)
     local results = {}
+  
+    -- BRANCH: C Library Acceleration
+    if use_c_fuzzy and fuzzy_c then
+        local c_results = fuzzy_c.search(input, max_results)
+        for _, r in ipairs(c_results) do
+            local word = r.word
+            local max_len = math.max(#input, #word)
+            local score = (max_len > 0) and (r.score / max_len) or 1
+
+            if score < MAX_FUZZY_C_THRESHOLD_LEVENSHTEIN then
+                local meta = c_metadata_cache[word]
+                table.insert(results, {
+                    word = word,
+                    def = meta and meta.definition or "",
+                    score = score,
+                    hash = meta and meta.hash or ""
+                })
+            end
+        end
+        return results
+    end
+
     local rows = query_rows("SELECT word, definition, content_hash FROM dictionary")
     for _, row in ipairs(rows) do
         if not (exclude_bad and row.content_hash == BAD_CONTENT_HASH) then
@@ -448,6 +513,8 @@ local function main(args)
         end
     end
     MAX_RESULTS = limit
+
+    if use_c_fuzzy then init_c_fuzzy() end
 
     if #new_args == 0 then
         repl()
